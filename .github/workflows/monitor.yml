@@ -1,0 +1,87 @@
+# Zewnetrzny monitor serwera HERBORG (zastepuje obserwator-health z komputera BIURO, wylaczony 12.11.2026).
+# Co 5 min (GitHub potrafi opozniac harmonogram o 5-20 min) sprawdza adresy z ZEWNATRZ serwera.
+# Awaria = 3 nieudane proby w odstepie 30 s. Alarm = OTWARTE zgloszenie (issue) z etykieta "awaria"
+# -> GitHub wysyla mail wlascicielowi. Powrot = komentarz + zamkniecie zgloszenia (drugi mail).
+# Przebieg NIE jest czerwony przy kazdej awarii (spam co 5 min) - czerwony tylko przy otwarciu alarmu.
+name: monitor
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      test_awarii:
+        description: "Symuluj awarie (test alarmu)"
+        type: boolean
+        default: false
+
+permissions:
+  issues: write
+  contents: read
+
+concurrency:
+  group: monitor
+  cancel-in-progress: false
+
+jobs:
+  sprawdz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Sprawdz adresy
+        id: spr
+        env:
+          TEST_AWARII: ${{ inputs.test_awarii || 'false' }}
+        run: |
+          set -u
+          sprawdz() { # $1 nazwa, $2 url, $3 wymagany tekst (opcjonalnie)
+            for proba in 1 2 3; do
+              kod=$(curl -sS -L -o body.txt -w '%{http_code}' --max-time 15 -A 'herborg-monitor/1.0 (+github actions)' "$2" 2>err.txt || true)
+              if [ "$kod" = "200" ] && { [ -z "${3:-}" ] || grep -q "$3" body.txt; }; then
+                echo "OK   $1 ($2) HTTP $kod, proba $proba"; return 0
+              fi
+              powod="HTTP ${kod:-brak} $(head -c 200 err.txt)"
+              [ "$proba" -lt 3 ] && sleep 30
+            done
+            echo "BLAD $1 ($2): $powod"
+            echo "- **$1** (\`$2\`): $powod" >> awarie.md
+            return 1
+          }
+          : > awarie.md
+          sprawdz "Serwer AI / MCP" "https://ai.herborg.pl/health" '"status":"ok"' || true
+          sprawdz "Sklep herborg.pl" "https://herborg.pl" || true
+          sprawdz "BOK / panel" "https://bok.herborg.pl" || true
+          if [ "$TEST_AWARII" = "true" ]; then echo "- **TEST** (reczny test alarmu, to nie jest prawdziwa awaria)" >> awarie.md; fi
+          # czy GitHub w ogole ma internet (zeby nie alarmowac przy awarii po stronie runnera)
+          if [ -s awarie.md ] && ! curl -s -o /dev/null --max-time 10 https://www.cloudflare.com/cdn-cgi/trace; then
+            echo "Runner nie ma internetu - pomijam ocene."; : > awarie.md
+          fi
+          if [ -s awarie.md ]; then echo "awaria=1" >> "$GITHUB_OUTPUT"; else echo "awaria=0" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Alarm / powrot przez zgloszenie
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          AWARIA: ${{ steps.spr.outputs.awaria }}
+        run: |
+          set -eu
+          gh label create awaria --color B60205 --description "Serwer HERBORG nie odpowiada" 2>/dev/null || true
+          otwarte=$(gh issue list --label awaria --state open --json number --jq '.[0].number // empty')
+          teraz=$(TZ=Europe/Warsaw date '+%Y-%m-%d %H:%M')
+          if [ "$AWARIA" = "1" ]; then
+            if [ -z "$otwarte" ]; then
+              {
+                echo "@ogloszenia-byte Monitor z zewnatrz wykryl awarie ($teraz czasu PL):"
+                echo; cat awarie.md; echo
+                echo "Gdy pada caly serwer, alerty mailowe z serwera tez nie dochodza - brak maili nie znaczy, ze jest spokojnie."
+                echo "Zgloszenie zamknie sie samo po powrocie."
+              } > tresc.md
+              gh issue create --title "AWARIA: serwer HERBORG nie odpowiada ($teraz)" --label awaria --body-file tresc.md
+              echo "::error::Otwarto alarm"; exit 1
+            else
+              echo "Alarm #$otwarte juz otwarty - bez nowego powiadomienia."
+            fi
+          elif [ -n "$otwarte" ]; then
+            gh issue comment "$otwarte" --body "Wszystko znowu odpowiada ($teraz czasu PL). Sprawdz, czy alerty z serwera doszly za okres ciszy."
+            gh issue close "$otwarte"
+          fi
